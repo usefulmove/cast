@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""
+asciinema-marker — add markers to asciinema .cast recordings.
+
+Usage:
+    python3 asciinema-marker.py FILE.ts add ABSOLUTE_TIME LABEL
+    python3 asciinema-marker.py FILE.ts add-relative SECONDS_FROM_START LABEL
+    python3 asciinema-marker.py FILE.ts list
+    python3 asciinema-marker.py FILE.ts clear
+
+The .cast v2 format header is rewritten in place; events are preserved.
+"""
+
+import json, sys, os
+
+def read_cast(path):
+    with open(path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    if not lines:
+        sys.exit(f"{path}: empty file")
+    header = json.loads(lines[0])
+    events = [json.loads(line) for line in lines[1:]]
+    return header, events
+
+def write_cast(path, header, events):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(header, ensure_ascii=False) + "\n")
+        for ev in events:
+            f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+
+def ensure_markers(header):
+    if "markers" not in header:
+        header["markers"] = []
+    return header["markers"]
+
+def list_markers(header):
+    markers = header.get("markers", [])
+    if not markers:
+        print("No markers.")
+        return
+    for m in markers:
+        print(f"  {m[0]:>10.6f}  {m[1]}")
+
+def add_marker_event(events, time, label=None):
+    """Insert an asciinema-compatible inline 'm' event at the correct position."""
+    ev = [round(float(time), 6), "m", label or ""]
+    # Insert maintaining chronological order; if same timestamp, insert before
+    # the first event with that timestamp or after events with lower timestamps
+    for i, existing in enumerate(events):
+        if existing[0] > ev[0]:
+            events.insert(i, ev)
+            return
+    events.append(ev)
+
+def add_marker(header, events, time, label):
+    markers = ensure_markers(header)
+    markers.append([float(time), str(label)])
+    markers.sort(key=lambda m: m[0])
+    add_marker_event(events, time, label)
+
+def clear_markers(header, events):
+    header["markers"] = []
+    events[:] = [ev for ev in events if ev[1] != "m"]
+
+def main():
+    if len(sys.argv) < 3:
+        print(__doc__)
+        sys.exit(1)
+
+    path = sys.argv[1]
+    cmd = sys.argv[2]
+
+    if not os.path.isfile(path):
+        sys.exit(f"{path}: not found")
+
+    header, events = read_cast(path)
+
+    if cmd == "list":
+        list_markers(header)
+    elif cmd == "clear":
+        clear_markers(header, events)
+        write_cast(path, header, events)
+        print("Markers cleared.")
+    elif cmd == "add":
+        if len(sys.argv) < 5:
+            sys.exit("Usage: ... add ABSOLUTE_TIME LABEL")
+        add_marker(header, events, sys.argv[3], sys.argv[4])
+        write_cast(path, header, events)
+        print(f"Marker added at {sys.argv[3]}s: {sys.argv[4]}")
+    elif cmd == "add-relative":
+        if len(sys.argv) < 5:
+            sys.exit("Usage: ... add-relative SECONDS_FROM_START LABEL")
+        offset = float(sys.argv[3])
+        add_marker(header, events, offset, sys.argv[4])
+        write_cast(path, header, events)
+        print(f"Marker added at +{offset}s: {sys.argv[4]}")
+    else:
+        print(__doc__)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

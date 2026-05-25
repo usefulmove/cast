@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""
+asciinema-marker-analyze — detect natural narrative markers in a .cast recording.
+
+Usage:
+    asciinema-marker-analyze FILE.cast [--suggest|--apply] [--json]
+
+States: PROMPT -> TYPING -> SUBMITTED -> OUTPUT -> PROMPT
+"""
+import argparse, json, os, re, sys
+
+# Tunables
+IDLE_TO_PROMOT = 0.4          # secs quiet to consider prompt stable
+MAX_TYPING_GAP = 1.5          # gap between keystrokes before we assume "done typing"
+SUBMIT_TIMEOUT = 5.0          # max secs after submit before we give up on output
+OUTPUT_BURST_CHARS = 60       # meaningful chars in output burst
+OUTPUT_BURST_MIN_WIN = 1.5    # min window in seconds for output_start
+
+def strip_ansi(text):
+    return re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)
+
+def plain_content(data):
+    # Returns (visible_len, a cleaned string without pure-ansi events)
+    cleaned = strip_ansi(data)
+    # Count actual printable / whitespace that isn't just CR
+    visible = ''.join(c for c in cleaned if c.isprintable() or c == ' ')
+    return visible, cleaned
+
+def is_bracketed_end(data):
+    return '\x1b[?2004l' in data
+
+def is_cr_lf(data):
+    return '\r\n' in data or '\r\r\n' in data
+
+def is_app_mode_end(data):
+    return '\x1b[?1l' in data
+
+class MarkerAnalyzer:
+    def __init__(self, path):
+        self.path = path
+        with open(path, 'r', encoding='utf-8') as f:
+            self.header = json.loads(f.readline())
+            self.events = [json.loads(line) for line in f]
+
+    def _contains_prompt(self, plain):
+        return '❭' in plain or '$ ' in plain or '# ' in plain or '> ' in plain
+
+    def analyze(self):
+        sugg = []
+        state = 'INIT'          # INIT -> PROMPT -> TYPING -> SUBMITTED -> OUTPUT -> PROMPT
+        last_prompt_ts = None
+        last_prompt_idx = None
+        typing_start_ts = None
+        submit_ts = None
+        output_start_ts = None
+
+        evs = self.events
+        n = len(evs)
+
+        for i, ev in enumerate(evs):
+            ts, etype, data = ev
+            visible, cleaned = plain_content(data)
+            vlen = len(visible)
+            is_prompt = self._contains_prompt(cleaned)
+
+            # --- transition: any state -> PROMPT ---
+            if is_prompt:
+                gap = ts - evs[last_prompt_idx][0] if last_prompt_idx is not None else 999
+                if gap > IDLE_TO_PROMOT or state in ('INIT', 'OUTPUT', 'SUBMITTED'):
+                    if state == 'INIT':
+                        label = 'session_start'
+                    elif state == 'OUTPUT':
+                        label = 'prompt_return'
+                    else:
+                        label = 'prompt_ready'
+                    sugg.append((ts, label, 0.92))
+                    state = 'PROMPT'
+                last_prompt_ts = ts
+                last_prompt_idx = i
+                typing_start_ts = None
+                submit_ts = None
+                output_start_ts = None
+                continue
+
+            # --- state logic ---
+            if state == 'PROMPT':
+                # anything non-prompt shortly after prompt is typing
+                # but bracketed paste echoes the full command, so "typing" can be long strings
+                if last_prompt_idx is not None:
+                    time_since_prompt = ts - evs[last_prompt_idx][0]
+                else:
+                    time_since_prompt = 0
+
+                # Detect start of typing after a brief quiet at the prompt
+                if time_since_prompt > 0.1 and etype == 'o':
+                    typing_start_ts = ts
+                    sugg.append((ts, 'input_start', 0.85))
+                    state = 'TYPING'
+
+            elif state == 'TYPING':
+                # Detect submit: bracketed paste end or explicit return
+                if is_bracketed_end(data) or is_app_mode_end(data) or is_cr_lf(data):
+                    submit_ts = ts
+                    sugg.append((ts, 'command_submit', 0.90))
+                    state = 'SUBMITTED'
+                # if idle too long while typing, user got distracted; mark as submit anyway?
+                elif i > 0 and ts - evs[i-1][0] > MAX_TYPING_GAP:
+                    # lost the actual submit signal; just guess here
+                    pass
+
+            elif state == 'SUBMITTED':
+                # Look for output start: meaningful text that isn't just cursor control
+                # Also detect if we already saw some output before submit_ts (pre-echo)
+                if vlen >= OUTPUT_BURST_CHARS:
+                    output_start_ts = ts
+                    sugg.append((ts, 'output_start', 0.80))
+                    state = 'OUTPUT'
+                # timeout/fallback
+                elif submit_ts and ts - submit_ts > SUBMIT_TIMEOUT:
+                    state = 'OUTPUT'  # may never have had visible output
+
+            elif state == 'OUTPUT':
+                pass  # we just wait for next PROMPT
+
+        # Deduplicate: within 0.3s keep first (they already flow chronologically)
+        dedup = []
+        for s in sugg:
+            if dedup and abs(s[0] - dedup[-1][0]) < 0.3:
+                continue
+            dedup.append(s)
+        return dedup
+
+    def print_suggestions(self):
+        print(f"\n{os.path.basename(self.path)} — suggested markers:\n")
+        print(f"{'  time':>10}  {'confidence':>10}  label")
+        print("-" * 40)
+        for ts, label, conf in self.suggestions:
+            bar = '█' * int(conf * 10) + '░' * (10 - int(conf * 10))
+            print(f"  {ts:8.3f}s  {bar}  {label}")
+
+    def apply(self, dry_run=True):
+        # Inline the marker helpers so we don't depend on importlib wreckage
+        def read_cast(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            header = json.loads(lines[0])
+            events = [json.loads(line) for line in lines[1:]]
+            return header, events
+
+        def write_cast(path, header, events):
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(json.dumps(header, ensure_ascii=False) + '\n')
+                for ev in events:
+                    f.write(json.dumps(ev, ensure_ascii=False) + '\n')
+
+        header, events = read_cast(self.path)
+        if 'markers' not in header:
+            header['markers'] = []
+        count = 0
+        for ts, label, _conf in self.suggestions:
+            header['markers'].append([float(ts), str(label)])
+            # Insert asciinema-compatible inline 'm' event
+            ev = [round(float(ts), 6), 'm', '']
+            for i, existing in enumerate(events):
+                if existing[0] > ev[0]:
+                    events.insert(i, ev)
+                    break
+            else:
+                events.append(ev)
+            count += 1
+        header['markers'].sort(key=lambda m: m[0])
+
+        if not dry_run:
+            write_cast(self.path, header, events)
+            print(f"Applied {count} markers to {self.path}.")
+        else:
+            print(f"\n[DRY RUN] Would apply {count} marker(s).  Use --apply to write.")
+
+    @property
+    def suggestions(self):
+        if not hasattr(self, '_sug'):
+            self._sug = self.analyze()
+        return self._sug
+
+def main():
+    parser = argparse.ArgumentParser(description="Suggest natural markers in .cast files")
+    parser.add_argument("cast_file", help="Path to .cast recording")
+    parser.add_argument("--apply", action="store_true", help="Write markers into the file")
+    parser.add_argument("--json", action="store_true", help="Output as JSON")
+    args = parser.parse_args()
+
+    sug = MarkerAnalyzer(args.cast_file)
+
+    if args.json:
+        out = [{"time": ts, "label": label, "confidence": conf}
+               for ts, label, conf in sug.suggestions]
+        print(json.dumps(out, indent=2))
+    else:
+        sug.print_suggestions()
+        sug.apply(dry_run=not args.apply)
+
+if __name__ == "__main__":
+    main()
