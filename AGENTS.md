@@ -71,9 +71,22 @@ Expected specialist lanes:
 
 ## Version control boundary
 
-Git authority belongs to Duane.
+Git authority belongs to Duane. Agents do not own repository history.
 
-Agents may use read-only git inspection commands. Agents must not stage, commit, amend, push, pull, fetch, merge, rebase, reset, clean, switch branches, delete refs, or otherwise mutate git state.
+Agents may use read-only git inspection commands.
+
+Agents may perform git mutations only behind an explicit, operation-scoped permission gate.
+
+Permission gate requirements:
+1. Duane names or approves the specific operation class (for example: add/set remote, stage files, commit, push).
+2. The agent states the target repo and intended commands before running them.
+3. Permission expires after the stated operation. Do not chain adjacent git mutations from one approval.
+
+Low-risk git config/transport changes, including `remote add` and `remote set-url`, still require the permission gate.
+
+Destructive or history-rewriting operations (`reset --hard`, `clean`, force push, amend, rebase, branch/tag deletion, restore that overwrites work) require a separate explicit destructive-operation confirmation and a recovery plan.
+
+If authorization is ambiguous, stop and hand the boundary back to Duane.
 
 Forking/cloning upstream asciinema is an explicit handoff boundary. Until Duane crosses it, this repo is a harness/design workspace, not a fork checkout.
 
